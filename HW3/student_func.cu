@@ -80,6 +80,47 @@
 */
 
 #include "utils.h"
+#include "stdio.h"
+
+// Parallel reduce function. op is a pointer to a function which takes two
+// floating point parameters and returns a single floating point value.
+// The d_workArea array is used to store intermediate computations - the final
+// value of the reduce operation will be found in the zeroth location.
+__global__ void reduce(const float* const d_logLuminance, const float* d_workArea,
+		       float (*op)(float, float), const size_t numRows, const size_t numCols)
+{
+    const int2 thread_2D_pos = make_int2( blockIdx.x * blockDim.x + threadIdx.x,
+					  blockIdx.y * blockDim.y + threadIdx.y);
+    if (thread_2D_pos.x >= numCols || thread_2D_pos.y >= numRows)
+	return;
+	
+    const int thread_1D_pos = thread_2D_pos.y * numCols + thread_2D_pos.x;
+    
+    unsigned int s = (numRows * numCols)/2; // half the array size
+    // Do the first computation, putting the result into the work area
+    d_workArea[thread_1D_pos] = op(d_logLuminance[thread_1D_pos],
+				   d_logLuminance[thread_1D_pos + s]);
+    
+    for (s>>=1; s > 0; s>>=1) {
+	if (thread_1D_pos < s && s == starts){
+	    d_workArea[thread_1D_pos] = op(d_workArea[thread_1D_pos], d_workArea[thread_1D_pos + s]);
+	}
+	__syncthreads();
+    }
+    
+}
+
+// Device function to compute max value of two floats
+__device__ float d_max(float a, float b)
+{
+    return a > b ? a : b;
+}
+
+// Device function to compute min value of two floats
+__device__ float d_min(float a, float b)
+{
+    return a > b ? b : a;
+}
 
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
@@ -100,5 +141,35 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
 
+    // Allocate device memory for reduce return values
+    // This should be a power of 2 for reduce to work properly
+    const dim3 blockSize(32,32,1);
+    const dim3 gridSize(ceil((float)numCols/blockSize.x),
+			ceil((float)numRows/blockSize.x), 1);
+    
+    // Allocate a work area half the size of the 1D array which stores the
+    // log luminance values
+    const int workSize = (sizeof(float) * numRows * numCols)/2;
+    const float* d_workArea;
+    checkCudaErrors(cudaMalloc(&d_workArea, workSize));
+    
+    // Get the max luminance value by calling reduce with the min function
+    reduce<<<gridSize, blockSize>>>(d_logLuminance, d_workArea, d_max,
+				    numRows, numCols);
+    // Copy the result of the reduce operation into the variable given by
+    // copying the first memory location in the work area.
+    checkCudaErrors(cudaMemcpy((void*) &max_logLum, d_workArea, sizeof(float),
+    			       cudaMemcpyDeviceToHost));
 
+
+    
+    // Get the minimum luminance value by calling reduce with the min function
+    reduce<<<gridSize, blockSize>>>(d_logLuminance, d_workArea, d_min,
+				    numRows, numCols);
+    // Copy the result of the reduce operation into the variable given by
+    // copying the first memory location in the work area.
+    /* checkCudaErrors(cudaMemcpy((void*) &min_logLum, d_workArea, sizeof(float), */
+    /* 			       cudaMemcpyDeviceToHost)); */
+
+    printf("Max luminance: %f, Min luminance: %f\n", max_logLum, min_logLum);
 }
